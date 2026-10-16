@@ -228,3 +228,6 @@ data/
 *.tfstate.*
 .terraform/
 
+
+terraform/terraform.tfvars
+terraform/build/

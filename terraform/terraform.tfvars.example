@@ -1,0 +1,3 @@
+# Copy this file to terraform.tfvars and fill it in.
+# terraform.tfvars is in .gitignore so your email stays out of the public repo.
+alert_email = "you@example.com"
