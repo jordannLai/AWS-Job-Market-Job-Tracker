@@ -1,0 +1,91 @@
+name: Deploy
+
+# Pull requests: check the code and show what Terraform would change.
+# Pushes to main: the same checks, then apply the changes to AWS.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # lets the workflow request an OIDC token for AWS
+  contents: read
+
+# Never run two deploys at once (they would fight over the Terraform state).
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+jobs:
+  checks:
+    name: Check Python code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile every Lambda function
+        run: python -m py_compile lambda/*/lambda_function.py
+
+  terraform:
+    name: Terraform ${{ github.event_name == 'pull_request' && 'plan' || 'apply' }}
+    needs: checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash # fail the step if any command in a pipe fails
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign in to AWS (no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.event_name == 'pull_request' && secrets.AWS_PLAN_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Init
+        run: terraform init -input=false
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+
+      - name: Show plan summary
+        run: |
+          {
+            echo "### Terraform plan"
+            echo '```'
+            grep -E '^(Plan:|No changes)' plan.txt || tail -n 5 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply
+        if: github.event_name != 'pull_request'
+        run: terraform apply -input=false tfplan
+
+      - name: Refresh the dashboard page in CloudFront
+        if: github.event_name != 'pull_request'
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$(terraform output -raw cloudfront_distribution_id)" \
+            --paths "/index.html"
