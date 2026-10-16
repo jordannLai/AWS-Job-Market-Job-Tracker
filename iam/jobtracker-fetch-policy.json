@@ -8,8 +8,18 @@
         },
         {
             "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::jobtracker-jordanlai-data",
+            "Condition": {
+                "StringLike": {
+                    "s3:prefix": "raw/*"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
             "Action": "ssm:GetParameters",
-            "Resource": "arn:aws:ssm:us-east-2:*:parameter/jobtracker/*"
+            "Resource": "arn:aws:ssm:us-east-2:*:paraws s3 ls s3://jobtracker-jordanlai-data/processed/postings/ --profile jobtrackerameter/jobtracker/*"
         }
     ]
 }

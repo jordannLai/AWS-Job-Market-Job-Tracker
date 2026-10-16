@@ -11,8 +11,10 @@ Setup this function expects:
   - SSM Parameter Store SecureStrings:
         /jobtracker/adzuna_app_id
         /jobtracker/adzuna_app_key
-  - Execution role allowed to: ssm:GetParameter on /jobtracker/*
+  - Execution role allowed to: ssm:GetParameters on /jobtracker/*
                                 s3:PutObject on <bucket>/raw/*
+                                s3:ListBucket on <bucket> (raw/ prefix)
+  - Timeout of at least 3 minutes (retries can add waiting time)
 
 Uses only the Python standard library + boto3 (built into Lambda),
 so there is nothing extra to package.
@@ -41,6 +43,9 @@ RESULTS_PER_PAGE = 50
 PAGES_PER_QUERY = 2       # 3 terms x 2 pages = 6 API calls per run
 MAX_DAYS_OLD = 7
 
+MAX_ATTEMPTS = 3          # tries per API request before giving up
+BACKOFF_BASE_SECONDS = 3  # waits 3s, then 9s, between tries
+
 BASE_URL = f"https://api.adzuna.com/v1/api/jobs/{COUNTRY}/search"
 PARAM_PREFIX = "/jobtracker"
 
@@ -64,7 +69,12 @@ def get_credentials():
 
 
 def fetch_page(app_id, app_key, search_term, page):
-    """Call the Adzuna search endpoint for one page of results."""
+    """
+    Call the Adzuna search endpoint for one page of results.
+
+    Temporary failures (HTTP 429/5xx, network errors) are retried with
+    exponential backoff: wait 3s, then 9s, before giving up.
+    """
     params = urllib.parse.urlencode({
         "app_id": app_id,
         "app_key": app_key,
@@ -74,12 +84,28 @@ def fetch_page(app_id, app_key, search_term, page):
         "content-type": "application/json",
     })
     url = f"{BASE_URL}/{page}?{params}"
-    try:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            return json.loads(response.read())
-    except urllib.error.HTTPError as err:
-        # Don't include the URL in the error: it contains the API key.
-        raise RuntimeError(f"Adzuna returned HTTP {err.code} for '{search_term}' page {page}") from None
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as err:
+            # Never include the URL in errors or logs: it contains the API key.
+            problem = f"HTTP {err.code}"
+            retryable = err.code == 429 or err.code >= 500
+        except (urllib.error.URLError, TimeoutError) as err:
+            problem = f"network error ({type(err).__name__})"
+            retryable = True
+
+        if not retryable or attempt == MAX_ATTEMPTS:
+            raise RuntimeError(
+                f"Adzuna request failed for '{search_term}' page {page}: {problem} "
+                f"(attempt {attempt} of {MAX_ATTEMPTS})"
+            ) from None
+
+        wait = BACKOFF_BASE_SECONDS * (3 ** (attempt - 1))
+        print(f"  {problem} for '{search_term}' page {page}; retrying in {wait}s")
+        time.sleep(wait)
 
 
 def fetch_term(app_id, app_key, search_term, run_date):
@@ -105,10 +131,19 @@ def fetch_term(app_id, app_key, search_term, run_date):
     }
 
 
+def raw_key(run_date, search_term):
+    return f"raw/dt={run_date}/{search_term.replace(' ', '_')}.json"
+
+
+def already_saved(bucket, run_date):
+    """Return the set of S3 keys already written for this date."""
+    response = s3.list_objects_v2(Bucket=bucket, Prefix=f"raw/dt={run_date}/")
+    return {obj["Key"] for obj in response.get("Contents", [])}
+
+
 def save_raw(bucket, payload):
     """Write one search term's results to S3 and return the object key."""
-    filename = payload["search_term"].replace(" ", "_") + ".json"
-    key = f"raw/dt={payload['fetched_on']}/{filename}"
+    key = raw_key(payload["fetched_on"], payload["search_term"])
     s3.put_object(
         Bucket=bucket,
         Key=key,
@@ -125,11 +160,31 @@ def lambda_handler(event, context):
     run_date = datetime.now(timezone.utc).date().isoformat()
     app_id, app_key = get_credentials()
 
-    summary = []
+    # Idempotent: if Lambda retries this run, or you re-run it by hand,
+    # job titles already saved today are skipped instead of re-fetched.
+    existing = already_saved(bucket, run_date)
+
+    saved, skipped, failed = [], [], []
     for term in SEARCH_TERMS:
-        payload = fetch_term(app_id, app_key, term, run_date)
+        if raw_key(run_date, term) in existing:
+            print(f"Skipping '{term}': already saved for {run_date}")
+            skipped.append(term)
+            continue
+        try:
+            payload = fetch_term(app_id, app_key, term, run_date)
+        except RuntimeError as err:
+            # One job title failing shouldn't stop the others.
+            print(f"[ERROR] {err}")
+            failed.append(term)
+            continue
         key = save_raw(bucket, payload)
         print(f"Saved {len(payload['results'])} postings for '{term}' -> s3://{bucket}/{key}")
-        summary.append({"search_term": term, "postings": len(payload["results"]), "s3_key": key})
+        saved.append({"search_term": term, "postings": len(payload["results"]), "s3_key": key})
 
-    return {"status": "ok", "date": run_date, "files": summary}
+    result = {"date": run_date, "saved": saved, "skipped": skipped, "failed": failed}
+    if failed:
+        # Raising marks the run as failed, so Lambda retries it (only the
+        # failed titles get fetched again) and it shows up in CloudWatch.
+        raise RuntimeError(f"Fetch incomplete for {run_date}: failed {failed}. Result: {json.dumps(result)}")
+
+    return {"status": "ok", **result}
