@@ -6,7 +6,7 @@
 variable "github_repo" {
   description = "GitHub repository allowed to deploy, as owner/name."
   type        = string
-  default     = "jordannLai/aws-job-market-tracker"
+   default     = "jordannLai/AWS-Job-Market-Job-Tracker"
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
