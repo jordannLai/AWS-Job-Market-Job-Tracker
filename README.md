@@ -1,10 +1,12 @@
 # AWS Job Market Tracker
 
+![Deploy](https://github.com/jordannLai/AWS-Job-Market-Job-Tracker/actions/workflows/deploy.yml/badge.svg)
+
 A serverless data pipeline on AWS that collects tech job postings every day and tracks which skills employers ask for across cloud, data, and software engineering roles.
 
-**Live dashboard:** [YOUR-CLOUDFRONT-URL](https://YOUR-CLOUDFRONT-URL)
+**Live dashboard:** [https://d25157ptmfxh2g.cloudfront.net%)](https://d25157ptmfxh2g.cloudfront.net%)
 
-> **Status:** Live. The pipeline runs automatically every morning and the dashboard updates itself. Next up is Infrastructure as Code and CI/CD (see [Roadmap](#roadmap)).
+> **Status:** Live. The pipeline runs every morning, the dashboard updates itself, every resource is defined in Terraform, and every push to `main` deploys through GitHub Actions.
 
 ## Why I built this
 
@@ -53,7 +55,9 @@ flowchart LR
 3. **Query.** An Athena table defined in the Glue Data Catalog sits on top of the processed data for ad hoc SQL analysis. Partition projection maps each `dt=` folder to a partition automatically, and a view (`postings_unique`) removes postings that appear on several days.
 4. **Publish (8:30 AM ET).** A third Lambda reads the full processed history, computes the dashboard's numbers (skill shares by role, cloud platform trends, median salaries), and writes them as one small `summary.json` file to a separate website bucket.
 5. **Serve.** The dashboard is a single static `index.html` that loads `summary.json` in the browser. CloudFront serves both over HTTPS from a private S3 bucket, so there is no server or database query on page load.
-6. **Security.** IAM follows least privilege at every stage. Each Lambda can read only the stage before it and write only its own output prefix. Each EventBridge schedule has its own role that can invoke only its target function. The website bucket blocks all public access, and CloudFront reads it through Origin Access Control.
+6. **Monitoring.** A CloudWatch alarm on each Lambda emails me through SNS if any stage fails. A second alarm acts as a dead man's switch: it fires if the publish step hasn't run at all in 24 hours, which catches a disabled schedule that error alarms would miss.
+7. **Deployment.** All infrastructure is defined in Terraform. On a pull request, GitHub Actions checks the Python code and runs `terraform plan` with a read-only role. On a push to `main`, it runs `terraform apply` and refreshes the dashboard in CloudFront. GitHub signs in to AWS with OIDC, so no AWS keys are stored in GitHub.
+8. **Security.** IAM follows least privilege at every stage. Each Lambda can read only the stage before it and write only its own output prefix. Each EventBridge schedule has its own role that can invoke only its target function. The website bucket blocks all public access, and CloudFront reads it through Origin Access Control.
 
 ## AWS services used
 
@@ -66,8 +70,11 @@ flowchart LR
 | AWS Glue Data Catalog | Table and view definitions for the processed data |
 | Amazon Athena | Serverless SQL analysis directly on S3 |
 | Amazon CloudFront | HTTPS delivery and caching for the dashboard, with Origin Access Control |
-| AWS IAM | Least-privilege roles and policies for each component |
-| Amazon CloudWatch Logs | Function logging, run history, and debugging |
+| AWS IAM | Least-privilege roles for each component, plus OIDC federation for GitHub Actions |
+| Amazon CloudWatch | Logs for every function, and alarms for failures and stalled runs |
+| Amazon SNS | Email alerts when an alarm fires |
+| Terraform | Infrastructure as Code for every resource, with state stored in S3 |
+| GitHub Actions | CI/CD: code checks and `terraform plan` on pull requests, `terraform apply` on `main` |
 
 ## Findings so far
 
@@ -92,10 +99,16 @@ The [live dashboard](https://YOUR-CLOUDFRONT-URL) shows the current numbers, whi
 ├── athena/
 │   ├── setup.sql                        # Database, table (partition projection), dedup view
 │   └── queries.sql                      # Analysis queries
-├── iam/
-│   ├── jobtracker-fetch-policy.json     # Least-privilege policy for each Lambda
-│   ├── jobtracker-transform-policy.json
-│   └── jobtracker-publish-policy.json
+├── terraform/
+│   ├── main.tf                          # Pipeline stages defined once, used everywhere
+│   ├── lambda.tf, scheduler.tf          # Functions, log groups, daily schedules
+│   ├── iam.tf                           # Least-privilege roles for each Lambda and the scheduler
+│   ├── s3.tf, cloudfront.tf             # Buckets, CloudFront, bucket policy, dashboard page
+│   ├── monitoring.tf                    # Failure and stalled-pipeline alarms, SNS email
+│   ├── github_actions.tf                # OIDC provider and the plan/deploy roles
+│   └── imports.tf, cloudfront_import.tf # How the console-built resources were imported
+├── .github/workflows/deploy.yml         # CI/CD pipeline
+├── iam/                                 # Original hand-written policies (now in terraform/iam.tf)
 ├── fetch_jobs.py                        # Local prototype of the ingestion script
 ├── analyze_skills.py                    # Local prototype of the skill analysis
 └── README.md
@@ -122,7 +135,20 @@ ORDER BY p.search_term, pct DESC;
 
 More queries are in [`athena/queries.sql`](athena/queries.sql).
 
-## Running locally
+## Deploying
+
+Every push to `main` deploys automatically. To work locally:
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars   # add your alert email
+terraform init
+terraform plan                                 # preview changes
+```
+
+Changes go live through a pull request: GitHub Actions posts the plan, and merging to `main` applies it.
+
+## Running the prototype locally
 
 The local scripts are the prototype the Lambda functions grew out of.
 
@@ -148,6 +174,12 @@ python analyze_skills.py   # prints a skills report, writes data/processed/skill
 - **Precomputed dashboard data.** The publish Lambda computes every number once a day and writes a 3 KB JSON file. The dashboard is fully static, so it loads instantly, costs nothing per visit, and can't be used to run expensive queries.
 - **Separate, private website bucket.** The site lives in its own bucket, so the data lake never needs public access. CloudFront reads the site bucket through Origin Access Control, and the bucket itself blocks all public access.
 - **Different cache lifetimes for page and data.** `summary.json` is cached for one hour, so the morning update appears quickly. `index.html` is cached for five minutes. CloudFront invalidations are used when a change must appear immediately.
+- **Imported, not rebuilt.** The pipeline was first built in the console. Terraform `import` blocks brought every existing resource under management with zero downtime and no data loss, and the first apply reported 0 resources destroyed. CloudFront's config was generated from the live distribution with `terraform plan -generate-config-out`, then cleaned up by hand.
+- **Remote state with native locking.** Terraform state lives in a versioned S3 bucket, and S3's native lock file stops two runs (for example, a local apply and a CI deploy) from changing it at the same time.
+- **OIDC instead of stored keys.** GitHub Actions gets short-lived AWS credentials by proving which repo and branch it runs from. The trust policy matches GitHub's immutable owner and repo IDs, so renaming the repo can't break deploys, and nobody who later claims the old name can assume the role.
+- **Separate plan and deploy roles.** Pull requests get a read-only role that can only run `terraform plan`. The admin-level deploy role can only be assumed from the `main` branch.
+- **Secrets stay out of Terraform state.** The Adzuna keys live in Parameter Store and are never read by Terraform. Lambda reads them at runtime, and the alert email is passed in as a GitHub secret.
+- **A dead man's switch, not just error alarms.** Error alarms can't fire for a function that never runs, so a separate alarm watches for the publish step not running at all.
 - **No WAF on the dashboard.** AWS WAF has a fixed monthly cost, and a read-only static site with no forms or logins gains little from it. CloudFront includes AWS Shield Standard for basic DDoS protection at no extra cost.
 - **JSON Lines for processed data.** It is simple to write with the Python standard library and Athena reads it natively. At this data volume, converting to Parquet would add packaging complexity for little benefit. Parquet is the planned format if the dataset grows.
 - **Parameter Store over Secrets Manager.** Standard SecureString parameters are free and meet the need here. Secrets Manager adds automatic rotation, which this API key doesn't require.
@@ -160,7 +192,7 @@ python analyze_skills.py   # prints a skills report, writes data/processed/skill
 - **Sparse salary data.** Most postings don't state a salary. Adzuna's estimated salaries (`salary_is_predicted = 1`) are excluded from salary analysis.
 - **Keyword matching.** Skills are detected by keyword matching, which can miss synonyms or catch unrelated uses of a word.
 - **Gaps from API outages.** October 15 is missing data and software engineer postings because of Adzuna errors that occurred before retry logic was added.
-- **Manual deployment.** Resources were created in the AWS console. Terraform and CI/CD are next on the roadmap.
+- **Athena schema lives in SQL.** The Athena table and view are defined in `athena/setup.sql` instead of Terraform, since the deduplication view is easier to read and change as SQL.
 
 ## Roadmap
 
@@ -170,9 +202,11 @@ python analyze_skills.py   # prints a skills report, writes data/processed/skill
 - [x] Transformation Lambda: raw JSON to flat, skill-tagged rows
 - [x] Glue Data Catalog and Athena for SQL analysis, with a deduplicated view
 - [x] Public dashboard: publish Lambda, private S3 site bucket, CloudFront
-- [ ] Infrastructure as Code with Terraform
-- [ ] CI/CD with GitHub Actions
-- [ ] CloudWatch alarm and SNS email alert on failed runs
+- [x] Infrastructure as Code with Terraform, importing the console-built resources
+- [x] CloudWatch alarms and SNS email alerts for failed or stalled runs
+- [x] CI/CD with GitHub Actions and OIDC (plan on pull requests, apply on `main`)
+
+Possible next steps: convert processed data to Parquet, track more roles, and add unit tests for the skill-matching logic.
 
 ## Data source
 
