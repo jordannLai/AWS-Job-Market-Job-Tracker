@@ -4,7 +4,7 @@
 
 A serverless data pipeline on AWS that collects tech job postings every day and tracks which skills employers ask for across cloud, data, and software engineering roles.
 
-**Live dashboard:** [https://d25157ptmfxh2g.cloudfront.net%)](https://d25157ptmfxh2g.cloudfront.net%)
+**Live dashboard:** [https://d25157ptmfxh2g.cloudfront.net%](https://d25157ptmfxh2g.cloudfront.net%)
 
 > **Status:** Live. The pipeline runs every morning, the dashboard updates itself, every resource is defined in Terraform, and every push to `main` deploys through GitHub Actions.
 
