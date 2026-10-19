@@ -3,10 +3,13 @@
 # OIDC token. AWS trades that token for temporary credentials, so no access
 # keys are ever saved in GitHub.
 
-variable "github_repo" {
-  description = "GitHub repository allowed to deploy, as owner/name."
+# GitHub identifies the repo in its OIDC token as owner@ownerID/repo@repoID.
+# The numeric IDs never change, so renaming the repo can't break deploys and
+# nobody who later takes over the old name could ever assume these roles.
+variable "github_repo_subject" {
+  description = "Repo part of GitHub's OIDC subject claim, as owner@id/repo@id."
   type        = string
-   default     = "jordannLai/AWS-Job-Market-Job-Tracker"
+  default     = "jordannLai@147177497/AWS-Job-Market-Job-Tracker@1410640189"
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
@@ -31,7 +34,7 @@ data "aws_iam_policy_document" "github_deploy_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
+      values   = ["repo:${var.github_repo_subject}:ref:refs/heads/main"]
     }
   }
 }
@@ -68,7 +71,7 @@ data "aws_iam_policy_document" "github_plan_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:pull_request"]
+      values   = ["repo:${var.github_repo_subject}:pull_request"]
     }
   }
 }
